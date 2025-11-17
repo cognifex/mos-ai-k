@@ -341,10 +341,13 @@ def generate_palette_tile_set(folder, palette_size, output_root=None, prefix="pa
             writer.writerow([idx, target_color, _hex_color(target_color), os.path.basename(src_path), filename])
 
     preview_img = build_palette_image(color_cycle)
+    preview_path = os.path.join(out_dir, "palette_preview.png")
+    preview_img.save(preview_path)
     return {
         "directory": out_dir,
         "files": saved_files,
         "palette_image": preview_img,
+        "preview_path": preview_path,
         "palette_colors": color_cycle,
         "metadata": metadata_path,
         "count": len(saved_files),
@@ -617,6 +620,10 @@ class RasterAppBase:
         self.mosaic_resolution_var = None
         self.mosaic_resolution_box = None
         self.mosaic_resolution_options = []
+        self.gallery_listbox = None
+        self.gallery_items = []
+        self.gallery_preview_label = None
+        self.gallery_preview_image = None
 
     def _normalize_paths(self, paths):
         """Normiert Rückgaben aus Datei-Dialogen (String oder Sequenz)."""
@@ -746,6 +753,7 @@ class RasterAppBase:
         )
         self.log_message(summary)
         messagebox.showinfo("Palette erzeugt", summary)
+        self._add_to_gallery(result.get("preview_path"), f"Palette {result['count']} Farben", result["palette_image"])
 
     def _update_palette_preview(self, img):
         if img is None or not self.palette_preview_label:
@@ -756,6 +764,49 @@ class RasterAppBase:
         show_img = img.resize(new_size, Image.LANCZOS)
         self.palette_preview_image = ImageTk.PhotoImage(show_img)
         self.palette_preview_label.config(image=self.palette_preview_image)
+
+    def _add_to_gallery(self, path, label, pil_image):
+        if not self.gallery_listbox or pil_image is None:
+            return
+        entry = {
+            "path": path,
+            "label": label or os.path.basename(path or ""),
+            "image": pil_image.copy(),
+        }
+        self.gallery_items.append(entry)
+        self.gallery_listbox.insert("end", entry["label"])
+        self.gallery_listbox.selection_clear(0, "end")
+        last = self.gallery_listbox.size() - 1
+        if last >= 0:
+            self.gallery_listbox.selection_set(last)
+            self.gallery_listbox.see(last)
+            self._show_gallery_item(entry)
+
+    def _on_gallery_select(self, _event=None):
+        if not self.gallery_listbox:
+            return
+        selection = self.gallery_listbox.curselection()
+        if not selection:
+            return
+        idx = selection[0]
+        if 0 <= idx < len(self.gallery_items):
+            self._show_gallery_item(self.gallery_items[idx])
+
+    def _show_gallery_item(self, entry):
+        if not self.gallery_preview_label:
+            return
+        img = entry.get("image")
+        if img is None and entry.get("path") and os.path.isfile(entry["path"]):
+            img = Image.open(entry["path"]).convert("RGB")
+            entry["image"] = img
+        if img is None:
+            return
+        max_w, max_h = 300, 200
+        scale = min(max_w / img.width, max_h / img.height, 1.0)
+        new_size = (int(img.width * scale), int(img.height * scale))
+        show_img = img.resize(new_size, Image.LANCZOS)
+        self.gallery_preview_image = ImageTk.PhotoImage(show_img)
+        self.gallery_preview_label.config(image=self.gallery_preview_image, text=entry.get("label", ""))
 
     def _select_mosaic_image(self):
         path = filedialog.askopenfilename(
@@ -1026,62 +1077,65 @@ if DND_AVAILABLE:
             self._enable_drag_and_drop()
 
         def _build_ui(self):
-            frm = ttk.Frame(self, padding=10)
-            frm.pack(fill="both", expand=True)
+            root = ttk.Frame(self, padding=10)
+            root.pack(fill="both", expand=True)
 
-            # Kategorie
+            main = ttk.Frame(root)
+            main.pack(fill="both", expand=True)
+
+            control_area = ttk.Frame(main)
+            control_area.pack(side="left", fill="both", expand=True, padx=(0, 10))
+
+            preview_area = ttk.Frame(main, width=320)
+            preview_area.pack(side="right", fill="y")
+            preview_area.pack_propagate(False)
+
+            notebook = ttk.Notebook(control_area)
+            notebook.pack(fill="both", expand=True)
+
+            import_tab = ttk.Frame(notebook, padding=10)
+            raster_tab = ttk.Frame(notebook, padding=10)
+            palette_tab = ttk.Frame(notebook, padding=10)
+
+            notebook.add(import_tab, text="Kacheln")
+            notebook.add(raster_tab, text="Raster")
+            notebook.add(palette_tab, text="Paletten & Mosaik")
+
+            # --- Import Tab ---
             self.category_var = tk.StringVar(value="F")
-            ttk.Label(frm, text="Kategorie für Sortierung (F oder E):").pack(anchor="w")
-            ttk.Combobox(frm, textvariable=self.category_var, values=["F", "E"]).pack(fill="x")
+            ttk.Label(import_tab, text="Kategorie für Sortierung (F/E):").pack(anchor="w")
+            ttk.Combobox(import_tab, textvariable=self.category_var, values=["F", "E"], state="readonly").pack(fill="x", pady=(0, 4))
 
-            # Drop-Bereich
-            ttk.Label(frm, text="Dateien hierher ziehen:").pack(anchor="w")
-            self.drop_frame = ttk.Label(
-                frm,
-                text="⬇️ Dateien hier ablegen ⬇️",
-                relief="solid",
-                padding=20
-            )
-            self.drop_frame.pack(fill="both", expand=True, pady=5)
+            ttk.Label(import_tab, text="Dateien hierher ziehen:").pack(anchor="w")
+            self.drop_frame = ttk.Label(import_tab, text="⬇️ Dateien hier ablegen ⬇️", relief="solid", padding=20)
+            self.drop_frame.pack(fill="both", expand=True, pady=6)
 
-            ttk.Button(frm, text="…oder Dateien auswählen", command=self._select_files_dialog).pack(fill="x", pady=2)
-            ttk.Button(frm, text="Sortieren & umbenennen", command=self._on_sort).pack(fill="x", pady=5)
+            ttk.Button(import_tab, text="Dateien auswählen…", command=self._select_files_dialog).pack(fill="x", pady=2)
+            ttk.Button(import_tab, text="Sortieren & umbenennen", command=self._on_sort).pack(fill="x", pady=2)
 
-            # Muster
-            ttk.Label(frm, text="Muster (E/F, eine Zeile pro Zeile):").pack(anchor="w", pady=(10, 0))
-            self.pattern_box = tk.Text(frm, height=6)
+            # --- Raster Tab ---
+            ttk.Label(raster_tab, text="Muster (E/F pro Zeile):").pack(anchor="w")
+            self.pattern_box = tk.Text(raster_tab, height=8)
             self.pattern_box.insert("1.0", self.pattern_text_default)
-            self.pattern_box.pack(fill="both")
+            self.pattern_box.pack(fill="both", expand=True, pady=(0, 6))
 
-            # Shuffle
             self.shuffle_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(
-                frm,
+                raster_tab,
                 text="Shuffle Tiles (zufällige Reihenfolge)",
                 variable=self.shuffle_var
-            ).pack(anchor="w", pady=4)
+            ).pack(anchor="w", pady=(0, 6))
 
-            ttk.Button(frm, text="Raster generieren", command=self._on_generate).pack(fill="x", pady=5)
-            ttk.Button(frm, text="Alle Raster exportieren (Batch)", command=self._on_generate_all).pack(fill="x")
+            ttk.Button(raster_tab, text="Raster generieren", command=self._on_generate).pack(fill="x", pady=2)
+            ttk.Button(raster_tab, text="Batch-Export aller Kombinationen", command=self._on_generate_all).pack(fill="x", pady=2)
 
-            # Preview
-            self.preview_label = ttk.Label(frm)
-            self.preview_label.pack(fill="both", expand=True, pady=10)
-
-            ttk.Label(frm, text="Log:").pack(anchor="w")
-            self.log_text = tk.Text(frm, height=6, state="disabled")
-            self.log_text.pack(fill="both", expand=True, pady=(0, 6))
-
-            self.status_var = tk.StringVar(value="Bereit")
-            ttk.Label(frm, textvariable=self.status_var, relief="sunken").pack(fill="x")
-
-            # Palette
-            palette_frame = ttk.LabelFrame(frm, text="Farbspektrum")
-            palette_frame.pack(fill="both", expand=True, pady=(10, 0))
+            # --- Palette & Mosaik Tab ---
+            palette_frame = ttk.LabelFrame(palette_tab, text="Farbspektrum aus Kacheln")
+            palette_frame.pack(fill="x", expand=False, pady=(0, 10))
 
             self.palette_folder_var = tk.StringVar()
             folder_row = ttk.Frame(palette_frame)
-            folder_row.pack(fill="x", pady=4)
+            folder_row.pack(fill="x", pady=2)
             ttk.Label(folder_row, text="Ordner:").pack(side="left")
             ttk.Entry(folder_row, textvariable=self.palette_folder_var).pack(side="left", fill="x", expand=True, padx=4)
             ttk.Button(folder_row, text="…", width=3, command=self._select_palette_folder).pack(side="left")
@@ -1099,8 +1153,8 @@ if DND_AVAILABLE:
             self.palette_preview_label = ttk.Label(palette_frame)
             self.palette_preview_label.pack(fill="both", expand=True, pady=(4, 0))
 
-            mosaic_frame = ttk.LabelFrame(frm, text="Mosaik aus Palette")
-            mosaic_frame.pack(fill="both", expand=True, pady=(10, 0))
+            mosaic_frame = ttk.LabelFrame(palette_tab, text="Bild → Kachelmosaik")
+            mosaic_frame.pack(fill="both", expand=True)
 
             self.mosaic_image_var = tk.StringVar()
             img_row = ttk.Frame(mosaic_frame)
@@ -1118,14 +1172,37 @@ if DND_AVAILABLE:
 
             self.mosaic_resolution_var = tk.StringVar()
             ttk.Label(mosaic_frame, text="Auflösung:").pack(anchor="w")
-            self.mosaic_resolution_box = ttk.Combobox(
-                mosaic_frame,
-                textvariable=self.mosaic_resolution_var,
-                state="readonly"
-            )
+            self.mosaic_resolution_box = ttk.Combobox(mosaic_frame, textvariable=self.mosaic_resolution_var, state="readonly")
             self.mosaic_resolution_box.pack(fill="x", pady=2)
             ttk.Button(mosaic_frame, text="Auflösungen aktualisieren", command=self._update_mosaic_resolution_options).pack(fill="x", pady=2)
             ttk.Button(mosaic_frame, text="Mosaik generieren", command=self._generate_mosaic_image).pack(fill="x", pady=4)
+
+            # --- Preview / Gallery / Log ---
+            preview_group = ttk.LabelFrame(preview_area, text="Aktuelle Vorschau")
+            preview_group.pack(fill="both", expand=False)
+            self.preview_label = ttk.Label(preview_group)
+            self.preview_label.pack(fill="both", expand=True, padx=6, pady=6)
+
+            gallery_group = ttk.LabelFrame(preview_area, text="Galerie")
+            gallery_group.pack(fill="both", expand=True, pady=(10, 0))
+            gallery_inner = ttk.Frame(gallery_group)
+            gallery_inner.pack(fill="both", expand=True)
+            self.gallery_listbox = tk.Listbox(gallery_inner, height=6)
+            self.gallery_listbox.pack(side="left", fill="both", expand=True)
+            gallery_scroll = ttk.Scrollbar(gallery_inner, orient="vertical", command=self.gallery_listbox.yview)
+            gallery_scroll.pack(side="right", fill="y")
+            self.gallery_listbox.config(yscrollcommand=gallery_scroll.set)
+            self.gallery_listbox.bind("<<ListboxSelect>>", self._on_gallery_select)
+            self.gallery_preview_label = ttk.Label(gallery_group)
+            self.gallery_preview_label.pack(fill="both", expand=True, padx=6, pady=(6, 0))
+
+            log_group = ttk.LabelFrame(preview_area, text="Log")
+            log_group.pack(fill="both", expand=True, pady=(10, 0))
+            self.log_text = tk.Text(log_group, height=6, state="disabled")
+            self.log_text.pack(fill="both", expand=True)
+
+            self.status_var = tk.StringVar(value="Bereit")
+            ttk.Label(preview_area, textvariable=self.status_var, relief="sunken").pack(fill="x", pady=(8, 0))
 
             mosaic_frame = ttk.LabelFrame(frm, text="Mosaik aus Palette")
             mosaic_frame.pack(fill="both", expand=True, pady=(10, 0))
@@ -1207,6 +1284,8 @@ if DND_AVAILABLE:
             self._update_preview(last_img)
             for path in paths:
                 self.log_message(f"Raster gespeichert als: {path}")
+            if paths:
+                self._add_to_gallery(paths[-1], "Raster", last_img)
             self.set_status("Fertig.")
 
         def _on_generate_all(self):
@@ -1260,6 +1339,8 @@ if DND_AVAILABLE:
                 return
 
             self._update_preview(last_img)
+            if paths:
+                self._add_to_gallery(paths[-1], f"Batch ({len(paths)})", last_img)
             self.set_status("Batch abgeschlossen.")
             messagebox.showinfo("Batch abgeschlossen", f"{len(paths)} Raster gespeichert.")
 
@@ -1372,6 +1453,8 @@ else:
             self._update_preview(last_img)
             for path in paths:
                 self.log_message(f"Raster gespeichert als: {path}")
+            if paths:
+                self._add_to_gallery(paths[-1], "Raster", last_img)
             self.set_status("Fertig.")
 
         def _on_generate_all(self):
@@ -1425,6 +1508,8 @@ else:
                 return
 
             self._update_preview(last_img)
+            if paths:
+                self._add_to_gallery(paths[-1], f"Batch ({len(paths)})", last_img)
             self.set_status("Batch abgeschlossen.")
             messagebox.showinfo("Batch abgeschlossen", f"{len(paths)} Raster gespeichert.")
 
