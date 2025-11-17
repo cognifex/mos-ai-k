@@ -1,6 +1,18 @@
 {
-  "mosaic_image": "/home/cognifex/Pictures/cogni consult logo.png",
-  "last_dir": "/home/cognifex/repos/kachelbilder/output/palette_tiles/palette_tile_256_20251117_105858",
-  "mosaic_palette": "/home/cognifex/repos/kachelbilder/output/palette_tiles/palette_tile_256_20251117_105858",
-  "tile_type_count": 4
+  "mosaic_image": "/home/cognifex/Pictures/caro-pips.jpg",
+  "last_dir": "/home/cognifex/repos/kachelbilder/output/palette_tiles/palette_tile_4096_20251117_201922",
+  "mosaic_palette": "/home/cognifex/repos/kachelbilder/output/palette_tiles/palette_tile_4096_20251117_201922",
+  "tile_type_count": 4,
+  "gallery_section_preview_collapsed": false,
+  "gallery_section_dirs_collapsed": false,
+  "gallery_last_dir": "/home/cognifex/repos/kachelbilder/output",
+  "gallery_tile_size": 62,
+  "pane_main": 0.4774396642182581,
+  "pane_left": 0.8388625592417062,
+  "pane_right": 0.429042904290429,
+  "pane_gallery_main": 0.37423312883435583,
+  "pane_gallery_right": 0.8516129032258064,
+  "palette_folder": "/home/cognifex/repos/kachelbilder/kacheln/E",
+  "last_gallery_image": "/home/cognifex/repos/kachelbilder/output/mosaic_20251117_235751.png",
+  "last_preview_image": "output/mosaic_20251117_235751.png"
 }
