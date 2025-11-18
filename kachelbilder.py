@@ -14,10 +14,10 @@ import threading
 import subprocess
 import tkinter as tk
 from datetime import datetime
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, colorchooser
 import hashlib
 
-from PIL import Image, ImageTk, ImageDraw, ImageOps, ImageEnhance, ImageFilter, ImageStat
+from PIL import Image, ImageTk, ImageDraw, ImageOps, ImageEnhance, ImageFilter, ImageStat, ImageChops
 
 # Optional: Drag & Drop via tkinterdnd2 (falls installiert)
 DND_AVAILABLE = False
@@ -64,6 +64,32 @@ GALLERY_TILE_SIZE_PRESETS = [
     ("Groß", 128),
     ("Sehr groß", 168),
 ]
+HARMONY_MODES = [
+    ("Keine Anpassung", "none"),
+    ("Komplementär", "complementary"),
+    ("Analog", "analogous"),
+    ("Triadisch", "triadic"),
+    ("Split-Komplementär", "split_complementary"),
+    ("Monochrom", "monochrome"),
+]
+HARMONY_TINT_OPTIONS = [
+    ("Komplette Kachel tönen", "full"),
+    ("Nur Hintergrund tönen", "background"),
+]
+HARMONY_INTENSITY_PRESETS = [
+    ("Pastell", (0.75, 0.92)),
+    ("Standard", (1.0, 1.0)),
+    ("Lebhaft", (1.2, 1.06)),
+    ("Kräftig", (1.35, 1.12)),
+]
+FOREGROUND_VARIANT_OPTIONS = [
+    ("Neutral", {"brightness": 1.0}),
+    ("Heller", {"brightness": 1.18}),
+    ("Wärmer", {"brightness": 1.1, "overlay": (255, 184, 120), "alpha": 0.23}),
+    ("Kühler", {"brightness": 1.1, "overlay": (130, 190, 255), "alpha": 0.23}),
+]
+DEFAULT_HARMONY_BASE = "#ff8c3f"
+HARMONY_HUE_TOLERANCE = 30.0
 
 TYPE_SYMBOLS = ["A", "B", "C", "D", "E"]
 DEFAULT_TYPE_PATHS = {
@@ -73,6 +99,8 @@ DEFAULT_TYPE_PATHS = {
     "D": os.path.join(APP_ROOT, "E1"),
     "E": os.path.join(APP_ROOT, "kacheln", "E"),
 }
+TILE_META_CACHE_PATH = os.path.join(APP_ROOT, ".cache", "tile_metadata.json")
+_TILE_META_CACHE = None
 
 
 def _pattern_chessboard(size=8):
@@ -215,6 +243,159 @@ def palette_size_from_spec(spec: str) -> int:
 
 def ensure_folder(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+class ToolTip:
+    def __init__(self, widget, text, delay=600, wraplength=340):
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self.wraplength = wraplength
+        self._after_id = None
+        self.tip_window = None
+        widget.bind("<Enter>", self._schedule)
+        widget.bind("<Leave>", self._hide)
+        widget.bind("<ButtonPress>", self._hide)
+
+    def _schedule(self, _event=None):
+        self._cancel()
+        self._after_id = self.widget.after(self.delay, self._show)
+
+    def _cancel(self):
+        if self._after_id:
+            self.widget.after_cancel(self._after_id)
+            self._after_id = None
+
+    def _show(self):
+        if self.tip_window or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 10
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.tip_window = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        label = ttk.Label(
+            tw,
+            text=self.text,
+            justify="left",
+            background="#ffffe0",
+            relief="solid",
+            borderwidth=1,
+            wraplength=self.wraplength,
+            padding=4,
+        )
+        label.pack()
+
+    def _hide(self, _event=None):
+        self._cancel()
+        tw = self.tip_window
+        if tw:
+            tw.destroy()
+            self.tip_window = None
+
+def _load_tile_meta_cache():
+    global _TILE_META_CACHE
+    if _TILE_META_CACHE is not None:
+        return _TILE_META_CACHE
+    _TILE_META_CACHE = {}
+    if os.path.isfile(TILE_META_CACHE_PATH):
+        try:
+            with open(TILE_META_CACHE_PATH, "r", encoding="utf-8") as fh:
+                _TILE_META_CACHE = json.load(fh)
+        except Exception:
+            _TILE_META_CACHE = {}
+    return _TILE_META_CACHE
+
+
+def _save_tile_meta_cache():
+    if _TILE_META_CACHE is None:
+        return
+    ensure_folder(os.path.dirname(TILE_META_CACHE_PATH))
+    try:
+        with open(TILE_META_CACHE_PATH, "w", encoding="utf-8") as fh:
+            json.dump(_TILE_META_CACHE, fh)
+    except Exception:
+        pass
+
+
+def _compute_tile_metadata(path, image=None):
+    close_image = False
+    if image is None:
+        image = Image.open(path).convert("RGB")
+        close_image = True
+    stat = ImageStat.Stat(image)
+    mean_rgb = tuple(int(round(val)) for val in stat.mean[:3])
+    r, g, b = (val / 255.0 for val in mean_rgb)
+    hue, sat, val = colorsys.rgb_to_hsv(r, g, b)
+    meta = {
+        "mtime": os.path.getmtime(path),
+        "mean_rgb": mean_rgb,
+        "hue": hue * 360.0,
+        "saturation": sat,
+        "value": val,
+    }
+    bg_color = _estimate_tile_background_color(image)
+    if bg_color:
+        meta["background"] = bg_color
+    if close_image:
+        image.close()
+    return meta
+
+
+def _get_tile_metadata(path, image=None):
+    cache = _load_tile_meta_cache()
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    entry = cache.get(path)
+    if entry and abs(entry.get("mtime", 0) - mtime) < 0.0001:
+        return entry
+    meta = _compute_tile_metadata(path, image)
+    cache[path] = meta
+    _save_tile_meta_cache()
+    return meta
+
+
+def _quantize_color(rgb, step=32):
+    return tuple((channel // step) * step for channel in rgb)
+
+
+def _estimate_tile_background_color(img):
+    if not img or img.width < 2 or img.height < 2:
+        return None
+    sample_size = max(4, min(48, min(img.width, img.height) // 2 or 4))
+    sample = img.resize((sample_size, sample_size), Image.NEAREST)
+    buckets = {}
+    counts = {}
+    for pixel in sample.getdata():
+        q = _quantize_color(pixel)
+        counts[q] = counts.get(q, 0) + 1
+        bucket = buckets.setdefault(q, [0, 0, 0])
+        bucket[0] += pixel[0]
+        bucket[1] += pixel[1]
+        bucket[2] += pixel[2]
+    if not counts:
+        return None
+    best_key = max(counts.items(), key=lambda kv: kv[1])[0]
+    total = counts[best_key]
+    sums = buckets[best_key]
+    if total <= 0:
+        return None
+    return tuple(int(s / total) for s in sums)
+
+
+def _create_background_mask(img, bg_color, tolerance=35):
+    if not img or bg_color is None:
+        return None
+    base = img.convert("RGB")
+    bg_layer = Image.new("RGB", base.size, tuple(bg_color))
+    diff = ImageChops.difference(base, bg_layer).convert("L")
+    mask = diff.point(lambda v: 255 if v <= tolerance else 0)
+    if mask.getextrema() == (0, 0):
+        return None
+    mask = mask.filter(ImageFilter.GaussianBlur(radius=1))
+    return mask
 
 
 def next_number_in_folder(folder: str, prefix: str) -> int:
@@ -988,6 +1169,35 @@ def load_tiles(folder: str):
     return tiles
 
 
+def load_tile_infos(folder: str):
+    """Lädt Tiles mit Metadaten (Farbe, Pfad)."""
+    if not os.path.isdir(folder):
+        raise ValueError(f"Folder not found: {folder}")
+    infos = []
+    for name in sorted(os.listdir(folder)):
+        if not name.lower().endswith((".png", ".jpg", ".jpeg")):
+            continue
+        path = os.path.join(folder, name)
+        try:
+            img = Image.open(path).convert("RGB")
+        except OSError:
+            continue
+        meta = _get_tile_metadata(path, img) or {}
+        info = {
+            "path": path,
+            "image": img,
+            "mean_rgb": tuple(meta.get("mean_rgb") or (128, 128, 128)),
+            "hue": float(meta.get("hue", 0.0)),
+            "saturation": float(meta.get("saturation", 0.0)),
+            "value": float(meta.get("value", 0.0)),
+            "background": tuple(meta.get("background")) if meta.get("background") else None,
+        }
+        infos.append(info)
+    if not infos:
+        raise ValueError(f"No images in folder: {folder}")
+    return infos
+
+
 def normalize_tiles(tiles, size=None):
     """Bringt alle Tiles auf die gleiche Größe."""
     if not tiles:
@@ -1183,6 +1393,15 @@ class RasterAppBase:
         self.paned_meta = {}
         self.thumbnail_cache_dir = os.path.join(APP_ROOT, ".cache", "thumbnails")
         self._start_thumbnail_worker()
+        self.harmony_mode_var = None
+        self.harmony_base_color_var = None
+        self.harmony_tint_mode_var = None
+        self.harmony_intensity_var = None
+        self.harmony_contrast_var = None
+        self.harmony_texture_var = None
+        self.harmony_preserve_fg_var = None
+        self._tile_set_paths = {}
+        self._tile_infos = {}
 
     def _load_user_settings(self):
         if os.path.isfile(self.settings_path):
@@ -1216,6 +1435,11 @@ class RasterAppBase:
         if path:
             self.last_dir = path
             self._set_setting("last_dir", self.last_dir)
+
+    def _attach_tooltip(self, widget, text):
+        if not widget or not text:
+            return
+        ToolTip(widget, text)
 
     def _reset_palette_folder_default(self):
         if self.palette_folder_var:
@@ -1496,19 +1720,387 @@ class RasterAppBase:
         self.pattern_box.insert("1.0", self.pattern_text_default)
         self.pattern_box.pack(fill="both", expand=True, pady=(0, 6))
 
+        harmony_frame = ttk.LabelFrame(parent, text="Farbmodus & Harmonie")
+        harmony_frame.pack(fill="x", pady=(4, 4))
+        mode_labels = [label for label, _code in HARMONY_MODES]
+        default_mode = self._get_setting("harmony_mode", mode_labels[0])
+        if default_mode not in mode_labels:
+            default_mode = mode_labels[0]
+        self.harmony_mode_var = tk.StringVar(value=default_mode)
+        harmony_combo = ttk.Combobox(
+            harmony_frame,
+            textvariable=self.harmony_mode_var,
+            values=mode_labels,
+            state="readonly"
+        )
+        harmony_combo.pack(fill="x", pady=(0, 4))
+        self.harmony_mode_var.trace_add("write", self._on_harmony_mode_change)
+
+        base_row = ttk.Frame(harmony_frame)
+        base_row.pack(fill="x", pady=(0, 2))
+        ttk.Label(base_row, text="Basisfarbe (#RRGGBB):").pack(side="left")
+        default_color = self._get_setting("harmony_base_color", DEFAULT_HARMONY_BASE)
+        normalized_color = self._normalize_hex_color(default_color)
+        self.harmony_base_color_var = tk.StringVar(value=normalized_color)
+        base_entry = ttk.Entry(base_row, textvariable=self.harmony_base_color_var, width=12)
+        base_entry.pack(side="left", padx=(4, 4))
+        ttk.Button(base_row, text="Wählen…", command=self._choose_harmony_base_color).pack(side="left")
+        self.harmony_base_color_var.trace_add("write", self._on_harmony_base_color_change)
+        info_label = tk.Label(base_row, text=" (?)", fg="#666666", cursor="question_arrow")
+        info_label.pack(side="left")
+        self._attach_tooltip(info_label, "Die Basisfarbe bestimmt den Ausgangston für die gewählte Harmonie. "
+                                         "Komplementär-, Analog- usw. werden aus diesem Farbton berechnet; "
+                                         "alle Hintergründe orientieren sich an diesen abgeleiteten Farben.")
+        ttk.Label(harmony_frame, text="Intensität:").pack(anchor="w")
+        intensity_labels = [label for label, _ in HARMONY_INTENSITY_PRESETS]
+        default_intensity = self._get_setting("harmony_intensity", intensity_labels[1])
+        if default_intensity not in intensity_labels:
+            default_intensity = intensity_labels[1]
+        self.harmony_intensity_var = tk.StringVar(value=default_intensity)
+        ttk.Combobox(
+            harmony_frame,
+            textvariable=self.harmony_intensity_var,
+            values=intensity_labels,
+            state="readonly"
+        ).pack(fill="x", pady=(0, 4))
+        self.harmony_intensity_var.trace_add("write", self._on_harmony_intensity_change)
+        ttk.Label(harmony_frame, text="Tönungsmodus:").pack(anchor="w", pady=(4, 0))
+        tint_labels = [label for label, _code in HARMONY_TINT_OPTIONS]
+        default_tint = self._get_setting("harmony_tint_mode", tint_labels[0])
+        if default_tint not in tint_labels:
+            default_tint = tint_labels[0]
+        self.harmony_tint_mode_var = tk.StringVar(value=default_tint)
+        tint_combo = ttk.Combobox(
+            harmony_frame,
+            textvariable=self.harmony_tint_mode_var,
+            values=tint_labels,
+            state="readonly"
+        )
+        tint_combo.pack(fill="x", pady=(0, 4))
+        self.harmony_tint_mode_var.trace_add("write", self._on_harmony_tint_mode_change)
+        ttk.Label(harmony_frame, text="Vordergrund-Ton:").pack(anchor="w")
+        fg_labels = [label for label, _ in FOREGROUND_VARIANT_OPTIONS]
+        default_fg = self._get_setting("harmony_fg_variant", fg_labels[0])
+        if default_fg not in fg_labels:
+            default_fg = fg_labels[0]
+        self.harmony_fg_variant_var = tk.StringVar(value=default_fg)
+        ttk.Combobox(
+            harmony_frame,
+            textvariable=self.harmony_fg_variant_var,
+            values=fg_labels,
+            state="readonly"
+        ).pack(fill="x", pady=(0, 4))
+        self.harmony_fg_variant_var.trace_add("write", self._on_harmony_fg_variant_change)
+        self.harmony_preserve_fg_var = tk.BooleanVar(value=bool(int(self._get_setting("harmony_preserve_fg", 1))))
+        ttk.Checkbutton(
+            harmony_frame,
+            text="Vordergrundfarben beibehalten",
+            variable=self.harmony_preserve_fg_var,
+            command=self._on_harmony_preserve_toggle
+        ).pack(anchor="w")
+        self.harmony_contrast_var = tk.BooleanVar(value=bool(int(self._get_setting("harmony_contrast", 1))))
+        ttk.Checkbutton(
+            harmony_frame,
+            text="Kontrast verstärken",
+            variable=self.harmony_contrast_var,
+            command=self._on_harmony_contrast_toggle
+        ).pack(anchor="w")
+        self.harmony_texture_var = tk.BooleanVar(value=bool(int(self._get_setting("harmony_texture", 0))))
+        ttk.Checkbutton(
+            harmony_frame,
+            text="Leichte Textur hinzufügen",
+            variable=self.harmony_texture_var,
+            command=self._on_harmony_texture_toggle
+        ).pack(anchor="w")
+
     def _gather_tile_sets(self):
         if not self.tile_type_count_var:
             raise ValueError("Keine Bildtypen definiert")
         count = int(self.tile_type_count_var.get())
         symbols = TYPE_SYMBOLS[:count]
         tile_sets = {}
+        self._tile_set_paths = {}
+        self._tile_infos = {}
+        use_harmony = self._get_harmony_mode_code() != "none"
         for symbol in symbols:
             var = self.tile_type_path_vars.get(symbol)
             path = var.get().strip() if var else ""
             if not path:
                 raise ValueError(f"Kein Ordner für Typ {symbol}")
-            tile_sets[symbol] = load_tiles(path)
+            self._tile_set_paths[symbol] = path
+            if use_harmony:
+                infos = load_tile_infos(path)
+                tile_sets[symbol] = [info["image"] for info in infos]
+                self._tile_infos[symbol] = infos
+            else:
+                tile_sets[symbol] = load_tiles(path)
+        return self._apply_harmony_mode(tile_sets)
+
+    def _apply_harmony_mode(self, tile_sets):
+        if not tile_sets:
+            return tile_sets
+        mode = self._get_harmony_mode_code()
+        if mode == "none":
+            return tile_sets
+        base_rgb = self._get_harmony_base_rgb()
+        r, g, b = (val / 255.0 for val in base_rgb)
+        base_hue, base_sat, base_val = colorsys.rgb_to_hsv(r, g, b)
+        base_hue *= 360.0
+        target_sat = base_sat if base_sat > 0.05 else 0.65
+        target_val = base_val if base_val > 0.05 else 0.9
+        sat_factor, val_factor = self._get_harmony_intensity_factors()
+        target_sat = max(0.05, min(1.0, target_sat * sat_factor))
+        target_val = max(0.05, min(1.0, target_val * val_factor))
+        symbols = list(tile_sets.keys())
+        hues = self._resolve_harmony_hues(mode, base_hue, len(symbols))
+        for symbol, target_hue in zip(symbols, hues):
+            infos = self._tile_infos.get(symbol)
+            if not infos:
+                path = self._tile_set_paths.get(symbol)
+                if path:
+                    try:
+                        infos = load_tile_infos(path)
+                    except Exception:
+                        infos = None
+            if not infos:
+                continue
+            adjusted = []
+            target_rgb = self._hsv_to_rgb_tuple(target_hue / 360.0, target_sat, target_val)
+            for info in infos:
+                hue_val = info.get("hue", 0.0)
+                hue_diff = self._hue_distance(hue_val, target_hue)
+                if hue_diff <= HARMONY_HUE_TOLERANCE:
+                    adjusted.append(info["image"])
+                else:
+                    tinted = self._tint_tile_harmony(info, target_rgb)
+                    adjusted.append(tinted)
+            if adjusted:
+                tile_sets[symbol] = adjusted
         return tile_sets
+
+    def _get_harmony_mode_code(self):
+        if not self.harmony_mode_var:
+            return "none"
+        label = self.harmony_mode_var.get()
+        for display, code in HARMONY_MODES:
+            if label == display or label == code:
+                return code
+        return "none"
+
+    def _get_harmony_tint_mode(self):
+        if not self.harmony_tint_mode_var:
+            return "full"
+        label = self.harmony_tint_mode_var.get()
+        for display, code in HARMONY_TINT_OPTIONS:
+            if label == display or label == code:
+                return code
+        return "full"
+
+    def _get_harmony_intensity_factors(self):
+        label = self.harmony_intensity_var.get() if self.harmony_intensity_var else HARMONY_INTENSITY_PRESETS[1][0]
+        for display, factors in HARMONY_INTENSITY_PRESETS:
+            if display == label:
+                return factors
+        return HARMONY_INTENSITY_PRESETS[1][1]
+
+    def _harmony_contrast_enabled(self):
+        return bool(self.harmony_contrast_var.get()) if self.harmony_contrast_var else False
+
+    def _harmony_texture_enabled(self):
+        return bool(self.harmony_texture_var.get()) if self.harmony_texture_var else False
+
+    def _preserve_fg_colors(self):
+        if not self.harmony_preserve_fg_var:
+            return True
+        return bool(self.harmony_preserve_fg_var.get())
+
+    def _get_foreground_variant_params(self):
+        label = self.harmony_fg_variant_var.get() if self.harmony_fg_variant_var else FOREGROUND_VARIANT_OPTIONS[0][0]
+        for display, params in FOREGROUND_VARIANT_OPTIONS:
+            if display == label:
+                return params
+        return FOREGROUND_VARIANT_OPTIONS[0][1]
+
+    def _get_harmony_base_rgb(self):
+        hex_color = self._normalize_hex_color(
+            self.harmony_base_color_var.get() if self.harmony_base_color_var else DEFAULT_HARMONY_BASE
+        )
+        return tuple(int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+
+    def _normalize_hex_color(self, value):
+        raw = (value or "").strip()
+        if not raw:
+            return DEFAULT_HARMONY_BASE
+        if not raw.startswith("#"):
+            raw = f"#{raw}"
+        if len(raw) != 7:
+            return DEFAULT_HARMONY_BASE
+        try:
+            int(raw[1:], 16)
+        except ValueError:
+            return DEFAULT_HARMONY_BASE
+        return raw.upper()
+
+    def _choose_harmony_base_color(self):
+        current = self._normalize_hex_color(
+            self.harmony_base_color_var.get() if self.harmony_base_color_var else DEFAULT_HARMONY_BASE
+        )
+        color = colorchooser.askcolor(color=current, title="Basisfarbe wählen")
+        if color and color[1] and self.harmony_base_color_var:
+            self.harmony_base_color_var.set(color[1])
+
+    def _on_harmony_base_color_change(self, *_args):
+        if not self.harmony_base_color_var:
+            return
+        normalized = self._normalize_hex_color(self.harmony_base_color_var.get())
+        if self.harmony_base_color_var.get() != normalized:
+            self.harmony_base_color_var.set(normalized)
+            return
+        self._set_setting("harmony_base_color", normalized)
+
+    def _on_harmony_mode_change(self, *_args):
+        if not self.harmony_mode_var:
+            return
+        self._set_setting("harmony_mode", self.harmony_mode_var.get())
+        self._request_gallery_tile_render(force=True)
+
+    def _on_harmony_tint_mode_change(self, *_args):
+        if not self.harmony_tint_mode_var:
+            return
+        self._set_setting("harmony_tint_mode", self.harmony_tint_mode_var.get())
+        self._request_gallery_tile_render(force=True)
+
+    def _on_harmony_fg_variant_change(self, *_args):
+        if not self.harmony_fg_variant_var:
+            return
+        self._set_setting("harmony_fg_variant", self.harmony_fg_variant_var.get())
+        self._request_gallery_tile_render(force=True)
+
+    def _on_harmony_intensity_change(self, *_args):
+        if not self.harmony_intensity_var:
+            return
+        self._set_setting("harmony_intensity", self.harmony_intensity_var.get())
+        self._request_gallery_tile_render(force=True)
+
+    def _on_harmony_preserve_toggle(self, *_args):
+        if not self.harmony_preserve_fg_var:
+            return
+        self._set_setting("harmony_preserve_fg", 1 if self.harmony_preserve_fg_var.get() else 0)
+        self._request_gallery_tile_render(force=True)
+
+    def _on_harmony_contrast_toggle(self, *_args):
+        if not self.harmony_contrast_var:
+            return
+        self._set_setting("harmony_contrast", 1 if self.harmony_contrast_var.get() else 0)
+        self._request_gallery_tile_render(force=True)
+
+    def _on_harmony_texture_toggle(self, *_args):
+        if not self.harmony_texture_var:
+            return
+        self._set_setting("harmony_texture", 1 if self.harmony_texture_var.get() else 0)
+        self._request_gallery_tile_render(force=True)
+
+    def _resolve_harmony_hues(self, mode, base_hue, count):
+        if count <= 0:
+            return []
+        if mode == "analogous":
+            step = 30.0
+            start = -((count - 1) / 2.0) * step
+            offsets = [start + i * step for i in range(count)]
+        elif mode == "monochrome":
+            offsets = [0.0] * count
+        elif mode == "triadic":
+            base_offsets = [0.0, 120.0, 240.0]
+            offsets = [base_offsets[i % 3] + 30.0 * (i // 3) for i in range(count)]
+        elif mode == "split_complementary":
+            base_offsets = [0.0, 150.0, -150.0]
+            offsets = [base_offsets[i % 3] + 30.0 * (i // 3) for i in range(count)]
+        elif mode == "complementary":
+            base_offsets = [0.0, 180.0]
+            offsets = [base_offsets[i % 2] + 45.0 * (i // 2) for i in range(count)]
+        else:
+            step = 360.0 / max(1, count)
+            offsets = [i * step for i in range(count)]
+        return [((base_hue + offset) % 360.0) for offset in offsets[:count]]
+
+    def _hue_distance(self, h1, h2):
+        diff = abs((h1 - h2) % 360.0)
+        return diff if diff <= 180.0 else 360.0 - diff
+
+    def _hsv_to_rgb_tuple(self, h, s, v):
+        r, g, b = colorsys.hsv_to_rgb(h % 1.0, max(0.0, min(1.0, s)), max(0.0, min(1.0, v)))
+        return (int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
+
+    def _tint_tile_harmony(self, info, target_rgb):
+        base = info["image"].convert("RGB")
+        mode = self._get_harmony_tint_mode()
+        bg_color = info.get("background") or _estimate_tile_background_color(base)
+        bg_mask = None
+        if mode == "background":
+            bg_mask = _create_background_mask(base, bg_color, tolerance=40)
+            tinted_bg = tint_image_to_color(base, target_rgb, blend_factor=0.25)
+            result = Image.composite(tinted_bg, base, bg_mask) if bg_mask else tinted_bg
+        else:
+            result = tint_image_to_color(base, target_rgb, blend_factor=0.45)
+            if self._preserve_fg_colors():
+                bg_mask = _create_background_mask(base, bg_color, tolerance=45)
+                if bg_mask:
+                    fg_mask = ImageChops.invert(bg_mask)
+                    result = Image.composite(result, base, fg_mask)
+        result, fg_mask = self._apply_harmony_contrast_layers(result, base, bg_mask)
+        result = self._apply_foreground_variant(result, fg_mask)
+        if self._harmony_texture_enabled():
+            result = self._apply_texture_overlay(result)
+        return result
+
+    def _apply_harmony_contrast_layers(self, tinted, original, bg_mask):
+        fg_mask = None
+        if bg_mask:
+            fg_mask = ImageChops.invert(bg_mask.convert("L"))
+        if not self._harmony_contrast_enabled():
+            return tinted, fg_mask
+        if bg_mask is None:
+            enhanced = ImageEnhance.Contrast(tinted).enhance(1.05)
+            enhanced = ImageEnhance.Brightness(enhanced).enhance(1.05)
+            return enhanced, fg_mask
+        if bg_mask.mode != "L":
+            bg_mask = bg_mask.convert("L")
+        fg_mask = ImageChops.invert(bg_mask)
+        background_layer = ImageEnhance.Brightness(tinted).enhance(1.08)
+        foreground_layer = ImageEnhance.Brightness(tinted).enhance(1.02)
+        foreground_layer = ImageEnhance.Contrast(foreground_layer).enhance(1.03)
+        combined = Image.composite(background_layer, tinted, bg_mask)
+        combined = Image.composite(foreground_layer, combined, fg_mask)
+        combined = ImageEnhance.Color(combined).enhance(1.08)
+        return combined, fg_mask
+
+    def _apply_texture_overlay(self, image):
+        if image.mode != "RGB":
+            base = image.convert("RGB")
+        else:
+            base = image
+        noise = Image.effect_noise(base.size, 32).convert("L")
+        noise = ImageOps.autocontrast(noise)
+        noise = noise.point(lambda v: int(128 + (v - 128) * 0.35))
+        grain = Image.merge("RGB", (noise, noise, noise))
+        overlay = ImageChops.multiply(base, grain)
+        return Image.blend(base, overlay, 0.12)
+
+    def _apply_foreground_variant(self, image, fg_mask):
+        params = self._get_foreground_variant_params()
+        if not params:
+            return image
+        img = image
+        mask = fg_mask
+        if "brightness" in params and params["brightness"] != 1.0:
+            brightened = ImageEnhance.Brightness(img).enhance(params["brightness"])
+            img = Image.composite(brightened, img, mask) if mask else brightened
+        if "overlay" in params:
+            overlay = Image.new("RGB", img.size, params["overlay"])
+            alpha = params.get("alpha", 0.2)
+            blended = Image.blend(img, overlay, alpha)
+            img = Image.composite(blended, img, mask) if mask else blended
+        return img
 
     def _render_image_to_label(self, pil_image, label, photo_attr):
         if pil_image is None or label is None:
