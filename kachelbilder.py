@@ -11,12 +11,13 @@ import csv
 import json
 import queue
 import threading
+import subprocess
 import tkinter as tk
 from datetime import datetime
 from tkinter import ttk, filedialog, messagebox
 import hashlib
 
-from PIL import Image, ImageTk, ImageDraw, ImageOps
+from PIL import Image, ImageTk, ImageDraw, ImageOps, ImageEnhance, ImageFilter, ImageStat
 
 # Optional: Drag & Drop via tkinterdnd2 (falls installiert)
 DND_AVAILABLE = False
@@ -43,6 +44,26 @@ DEFAULT_PALETTE_FOLDER = os.path.join(APP_ROOT, "kacheln")
 DEFAULT_MOSAIC_PALETTE = os.path.join(APP_ROOT, "output", "palette_tiles")
 DEFAULT_MOSAIC_IMAGE = ""
 MAX_MOSAIC_DIMENSION = 8192  # px
+TILE_BRIGHTNESS_FACTORS = [0.85, 1.0, 1.15]
+DETAIL_THRESHOLD = 12.0
+MAX_SUBDIVISION_DEPTH = 2
+MIN_REGION_PIXELS = 24
+APPLY_UNSHARP_MASK = True
+ERROR_DIFFUSION_WEIGHTS = [
+    (1, 0, 7 / 16),
+    (-1, 1, 3 / 16),
+    (0, 1, 5 / 16),
+    (1, 1, 1 / 16),
+]
+PREVIEW_MAX_DIMENSION = 2048
+GALLERY_PREVIEW_MAX_DIMENSION = 1024
+GALLERY_TILE_SIZE_PRESETS = [
+    ("Sehr klein", 56),
+    ("Klein", 72),
+    ("Mittel", 96),
+    ("Groß", 128),
+    ("Sehr groß", 168),
+]
 
 TYPE_SYMBOLS = ["A", "B", "C", "D", "E"]
 DEFAULT_TYPE_PATHS = {
@@ -488,7 +509,17 @@ def generate_palette_tile_set(folder, palette_size, output_root=None, prefix="pa
 
     with open(metadata_path, "w", newline="", encoding="utf-8") as meta_file:
         writer = csv.writer(meta_file)
-        writer.writerow(["index", "palette_color", "hex", "source_file", "output_file"])
+        writer.writerow([
+            "index",
+            "palette_color",
+            "hex",
+            "source_file",
+            "output_file",
+            "lab_l",
+            "lab_a",
+            "lab_b",
+            "histogram",
+        ])
 
         for idx, (target_color, (src_path, img)) in enumerate(zip(color_cycle, tile_cycle), start=1):
             tinted = tint_image_to_color(img, target_color)
@@ -496,7 +527,19 @@ def generate_palette_tile_set(folder, palette_size, output_root=None, prefix="pa
             out_path = os.path.join(out_dir, filename)
             tinted.save(out_path)
             saved_files.append(out_path)
-            writer.writerow([idx, target_color, _hex_color(target_color), os.path.basename(src_path), filename])
+            lab = _image_mean_lab(tinted)
+            hist = _luminance_histogram(tinted)
+            writer.writerow([
+                idx,
+                target_color,
+                _hex_color(target_color),
+                os.path.basename(src_path),
+                filename,
+                f"{lab[0]:.4f}",
+                f"{lab[1]:.4f}",
+                f"{lab[2]:.4f}",
+                _hist_to_string(hist),
+            ])
             if progress_cb:
                 progress_cb(idx, resolved_size)
 
@@ -548,11 +591,24 @@ def read_palette_metadata(palette_dir):
             path = os.path.join(palette_dir, filename)
             if not os.path.isfile(path):
                 continue
+            hist = _parse_hist_string(row.get("histogram"))
+            try:
+                lab = (
+                    float(row.get("lab_l")) if row.get("lab_l") else None,
+                    float(row.get("lab_a")) if row.get("lab_a") else None,
+                    float(row.get("lab_b")) if row.get("lab_b") else None,
+                )
+                if lab[0] is None:
+                    lab = None
+            except ValueError:
+                lab = None
             entries.append({
                 "color": color,
                 "file": path,
                 "index": row.get("index"),
                 "hex": row.get("hex") or _hex_color(color),
+                "lab": lab,
+                "hist": hist,
             })
     if not entries:
         raise ValueError(f"Keine Palette-Kacheln in {metadata_path}")
@@ -563,14 +619,31 @@ def load_palette_tile_images(palette_dir):
     metadata = read_palette_metadata(palette_dir)
     tiles = []
     for entry in metadata:
-        img = Image.open(entry["file"]).convert("RGB")
-        img.load()
-        tiles.append({
-            "color": entry["color"],
-            "hex": entry["hex"],
-            "path": entry["file"],
-            "image": img,
-        })
+        base_img = Image.open(entry["file"]).convert("RGB")
+        base_img.load()
+        base_lab = entry.get("lab") or _image_mean_lab(base_img)
+        base_hist = entry.get("hist") or _luminance_histogram(base_img)
+        for factor in TILE_BRIGHTNESS_FACTORS:
+            if abs(factor - 1.0) < 0.001:
+                variant_img = base_img.copy()
+                variant_color = base_img.resize((1, 1), Image.LANCZOS).getpixel((0, 0))
+                variant_lab = base_lab
+                variant_hist = base_hist
+            else:
+                enhancer = ImageEnhance.Brightness(base_img)
+                variant_img = enhancer.enhance(factor)
+                variant_color = variant_img.resize((1, 1), Image.LANCZOS).getpixel((0, 0))
+                variant_lab = _image_mean_lab(variant_img)
+                variant_hist = _luminance_histogram(variant_img)
+            tiles.append({
+                "color": variant_color,
+                "hex": entry["hex"],
+                "path": entry["file"],
+                "image": variant_img,
+                "lab": variant_lab,
+                "hist": variant_hist,
+                "brightness": factor,
+            })
     return tiles
 
 
@@ -588,6 +661,131 @@ def _color_distance_sq(c1, c2):
     return dr * dr + dg * dg + db * db
 
 
+def _rgb_to_lab(r, g, b):
+    """Konvertiert RGB (0-255) in CIE LAB (D65)"""
+    def _pivot(c):
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+    r_lin = _pivot(r / 255.0)
+    g_lin = _pivot(g / 255.0)
+    b_lin = _pivot(b / 255.0)
+
+    x = r_lin * 0.4124 + g_lin * 0.3576 + b_lin * 0.1805
+    y = r_lin * 0.2126 + g_lin * 0.7152 + b_lin * 0.0722
+    z = r_lin * 0.0193 + g_lin * 0.1192 + b_lin * 0.9505
+
+    x /= 0.95047
+    y /= 1.00000
+    z /= 1.08883
+
+    def _pivot_xyz(t):
+        return t ** (1 / 3) if t > 0.008856 else (7.787 * t) + (16 / 116)
+
+    fx = _pivot_xyz(x)
+    fy = _pivot_xyz(y)
+    fz = _pivot_xyz(z)
+
+    l = max(0, 116 * fy - 16)
+    a = 500 * (fx - fy)
+    b = 200 * (fy - fz)
+    return (l, a, b)
+
+
+def _image_mean_lab(img, sample_size=32):
+    if img.width > sample_size or img.height > sample_size:
+        sample = img.resize((sample_size, sample_size), Image.LANCZOS)
+    else:
+        sample = img
+    total = len(sample.getdata())
+    if total == 0:
+        return (0.0, 0.0, 0.0)
+    sum_l = sum_a = sum_b = 0.0
+    for pixel in sample.getdata():
+        lab = _rgb_to_lab(*pixel)
+        sum_l += lab[0]
+        sum_a += lab[1]
+        sum_b += lab[2]
+    return (sum_l / total, sum_a / total, sum_b / total)
+
+
+def _luminance_histogram(img, bins=8):
+    gray = img.convert("L")
+    hist = gray.histogram()
+    bin_size = max(1, 256 // bins)
+    values = []
+    for i in range(bins):
+        start = i * bin_size
+        end = start + bin_size
+        values.append(sum(hist[start:end]))
+    total = sum(values) or 1
+    return [v / total for v in values]
+
+
+def _hist_to_string(hist):
+    return "|".join(f"{v:.6f}" for v in hist)
+
+
+def _parse_hist_string(text, bins=8):
+    if not text:
+        return None
+    try:
+        values = [float(v) for v in text.split("|") if v]
+    except ValueError:
+        return None
+    if len(values) != bins:
+        return None
+    total = sum(values)
+    if total <= 0:
+        return None
+    return values
+
+
+def _lab_distance_sq(lab1, lab2):
+    if not lab1 or not lab2:
+        return 0
+    return ((lab1[0] - lab2[0]) ** 2 +
+            (lab1[1] - lab2[1]) ** 2 +
+            (lab1[2] - lab2[2]) ** 2)
+
+
+def _hist_distance(hist1, hist2):
+    if not hist1 or not hist2 or len(hist1) != len(hist2):
+        return 0
+    return sum((a - b) ** 2 for a, b in zip(hist1, hist2))
+
+
+def _tile_match_score(tile, rgb, lab, hist):
+    weight_rgb = 0.5
+    weight_lab = 0.35
+    weight_hist = 0.15
+    return (
+        weight_rgb * _color_distance_sq(rgb, tile["color"]) +
+        weight_lab * _lab_distance_sq(lab, tile.get("lab")) +
+        weight_hist * _hist_distance(hist, tile.get("hist"))
+    )
+
+
+def _region_detail(region):
+    gray = region.convert("L")
+    stat = ImageStat.Stat(gray)
+    return math.sqrt(max(stat.var[0], 0.0))
+
+
+def _open_file_in_viewer(path):
+    if not path or not os.path.isfile(path):
+        return False
+    try:
+        if sys.platform.startswith("darwin"):
+            subprocess.Popen(["open", path])
+        elif os.name == "nt":
+            os.startfile(path)  # type: ignore[attr-defined]
+        else:
+            subprocess.Popen(["xdg-open", path])
+        return True
+    except Exception:
+        return False
+
+
 def suggest_mosaic_resolutions(image_path, tile_size, max_options=6):
     if not os.path.isfile(image_path):
         raise ValueError("Bild nicht gefunden.")
@@ -596,7 +794,7 @@ def suggest_mosaic_resolutions(image_path, tile_size, max_options=6):
         raise ValueError("Ungültige Tile-Größe.")
     with Image.open(image_path) as img:
         width, height = img.size
-    scales = [0.2, 0.4, 0.6, 0.8, 1, 1.2, 1.4, 1.6, 2, 3, 4]
+    scales = [0.05, 0.08, 0.12, 0.16, 0.2, 0.3, 0.4, 0.6, 0.8, 1, 1.5, 2]
     candidates = []
     for scale in scales:
         col = max(1, int(round(width * scale)))
@@ -661,20 +859,103 @@ def generate_mosaic_from_palette(image_path, palette_dir, cols=None, rows=None, 
         out_h = rows * cell_h
 
     mosaic = Image.new("RGB", (out_w, out_h))
+    scale_x = out_w / width
+    scale_y = out_h / height
+
+    min_region_w = max(MIN_REGION_PIXELS, tile_w)
+    min_region_h = max(MIN_REGION_PIXELS, tile_h)
 
     total = rows * cols
     processed = 0
+
+    err_r = [[0.0] * cols for _ in range(rows)]
+    err_g = [[0.0] * cols for _ in range(rows)]
+    err_b = [[0.0] * cols for _ in range(rows)]
+
+    def render_region(x0, y0, x1, y1, depth=0, color_bias=None):
+        region_w = max(1.0, x1 - x0)
+        region_h = max(1.0, y1 - y0)
+        box = (int(math.floor(x0)), int(math.floor(y0)), int(math.ceil(x1)), int(math.ceil(y1)))
+        if box[2] <= box[0]:
+            box = (box[0], box[1], box[0] + 1, box[3])
+        if box[3] <= box[1]:
+            box = (box[0], box[1], box[2], box[1] + 1)
+        region = target.crop(box)
+        detail = _region_detail(region)
+        if (
+            detail > DETAIL_THRESHOLD
+            and depth < MAX_SUBDIVISION_DEPTH
+            and region_w >= min_region_w
+            and region_h >= min_region_h
+        ):
+            xm = x0 + region_w / 2
+            ym = y0 + region_h / 2
+            quadrants = [
+                (render_region(x0, y0, xm, ym, depth + 1, color_bias), (xm - x0) * (ym - y0)),
+                (render_region(xm, y0, x1, ym, depth + 1, color_bias), (x1 - xm) * (ym - y0)),
+                (render_region(x0, ym, xm, y1, depth + 1, color_bias), (xm - x0) * (y1 - ym)),
+                (render_region(xm, ym, x1, y1, depth + 1, color_bias), (x1 - xm) * (y1 - ym)),
+            ]
+            total_area = sum(area for _, area in quadrants if area > 0)
+            valid = [item for item in quadrants if item[0] and item[1] > 0]
+            if not valid or total_area == 0:
+                return None
+            avg = []
+            for i in range(3):
+                avg.append(sum(color[i] * area for color, area in valid) / total_area)
+            return tuple(avg)
+
+        region_rgb = region.resize((1, 1), Image.LANCZOS).getpixel((0, 0))
+        if color_bias:
+            region_rgb = tuple(
+                int(max(0, min(255, (region_rgb[i] + color_bias[i]) / 2)))
+                for i in range(3)
+            )
+        region_lab = _rgb_to_lab(*region_rgb)
+        region_hist = _luminance_histogram(region)
+
+        best = min(entries, key=lambda e: _tile_match_score(e, region_rgb, region_lab, region_hist))
+        tile_img = best["image"]
+        dest_w = max(1, int(round(region_w * scale_x)))
+        dest_h = max(1, int(round(region_h * scale_y)))
+        if tile_img.size != (dest_w, dest_h):
+            tile_img = tile_img.resize((dest_w, dest_h), Image.LANCZOS)
+        dest_x = int(round(x0 * scale_x))
+        dest_y = int(round(y0 * scale_y))
+        mosaic.paste(tile_img, (dest_x, dest_y))
+        return best["color"]
+
     for y in range(rows):
         for x in range(cols):
-            color = small.getpixel((x, y))
-            best = min(entries, key=lambda e: _color_distance_sq(color, e["color"]))
-            tile_img = best["image"]
-            if tile_img.size != (cell_w, cell_h):
-                tile_img = tile_img.resize((cell_w, cell_h), Image.LANCZOS)
-            mosaic.paste(tile_img, (x * cell_w, y * cell_h))
+            x0 = x * width / cols
+            x1 = (x + 1) * width / cols
+            y0 = y * height / rows
+            y1 = (y + 1) * height / rows
+            base_rgb = small.getpixel((x, y))
+            adj_rgb = (
+                int(max(0, min(255, base_rgb[0] + err_r[y][x]))),
+                int(max(0, min(255, base_rgb[1] + err_g[y][x]))),
+                int(max(0, min(255, base_rgb[2] + err_b[y][x]))),
+            )
+            avg_color = render_region(x0, y0, x1, y1, 0, adj_rgb) or base_rgb
+            diff = (
+                adj_rgb[0] - avg_color[0],
+                adj_rgb[1] - avg_color[1],
+                adj_rgb[2] - avg_color[2],
+            )
+            for dx, dy, weight in ERROR_DIFFUSION_WEIGHTS:
+                nx = x + dx
+                ny = y + dy
+                if 0 <= nx < cols and 0 <= ny < rows:
+                    err_r[ny][nx] += diff[0] * weight
+                    err_g[ny][nx] += diff[1] * weight
+                    err_b[ny][nx] += diff[2] * weight
             processed += 1
             if progress_cb:
                 progress_cb(processed, total)
+
+    if APPLY_UNSHARP_MASK:
+        mosaic = mosaic.filter(ImageFilter.UnsharpMask(radius=2, percent=130, threshold=2))
 
     out_path = unique_output_path(prefix=prefix)
     mosaic.save(out_path)
@@ -851,6 +1132,7 @@ class RasterAppBase:
         self.gallery_current_dir = self.gallery_root
         self.gallery_files = []
         self.gallery_tile_size_var = None
+        self.gallery_tile_mode_var = None
         self.gallery_tile_scale = None
         self.gallery_tile_label = None
         self.gallery_tile_canvas = None
@@ -859,13 +1141,20 @@ class RasterAppBase:
         self.gallery_tile_tag_map = {}
         self.gallery_tile_rects = {}
         self.gallery_selected_file = None
+        self.gallery_selected_files = []
+        self.gallery_selection_anchor = None
         self.gallery_tile_render_pending = False
+        self._gallery_tile_render_info = None
+        self._gallery_render_token = 0
+        self._gallery_columns = 1
+        self._gallery_dir_scan_cache = {}
         self.thumbnail_placeholder_images = {}
         self.thumbnail_pending = set()
         self.thumbnail_stop = threading.Event()
         self.thumbnail_queue = queue.Queue()
         self.thumbnail_results = queue.Queue()
         self.thumbnail_worker = None
+        self.gallery_loading_var = None
         self.settings_path = SETTINGS_FILE
         self.user_settings = self._load_user_settings()
         self.last_dir = self.user_settings.get("last_dir", os.getcwd())
@@ -882,6 +1171,7 @@ class RasterAppBase:
         self._palette_preview_photo = None
         self._gallery_preview_base = None
         self._gallery_preview_photo = None
+        self.current_preview_path = None
         self.progress_label = None
         self.progress_bar = None
         self.progress_active = False
@@ -974,6 +1264,11 @@ class RasterAppBase:
             return
         paned, orient, default_ratio = info
         ratio = self._get_setting(f"pane_{key}", default_ratio)
+        try:
+            ratio = float(ratio)
+        except (TypeError, ValueError):
+            ratio = default_ratio
+        ratio = max(0.05, min(0.95, ratio))
         total = paned.winfo_width() if orient == "horizontal" else paned.winfo_height()
         if total <= 0:
             paned.after(100, lambda k=key: self._restore_paned_position(k))
@@ -1017,6 +1312,15 @@ class RasterAppBase:
         except Exception:
             return
 
+    def _purge_thumbnail_cache(self, path):
+        sizes = {size for _, size in GALLERY_TILE_SIZE_PRESETS}
+        for size in sizes:
+            cache_path = self._thumbnail_cache_path(path, size)
+            try:
+                os.remove(cache_path)
+            except OSError:
+                pass
+
     def _thumbnail_worker_loop(self):
         while not self.thumbnail_stop.is_set():
             try:
@@ -1037,6 +1341,7 @@ class RasterAppBase:
         if key in self.thumbnail_pending:
             return
         self.thumbnail_pending.add(key)
+        self._update_gallery_loading_status()
         self.thumbnail_queue.put(key)
 
     def _process_thumbnail_results(self):
@@ -1053,6 +1358,7 @@ class RasterAppBase:
             pass
         if updated:
             self._request_gallery_tile_render()
+        self._update_gallery_loading_status()
         if not self.thumbnail_stop.is_set():
             self.after(200, self._process_thumbnail_results)
 
@@ -1230,22 +1536,91 @@ class RasterAppBase:
     def _render_gallery_preview_label(self, _event=None):
         self._render_image_to_label(self._gallery_preview_base, self.gallery_preview_label, "_gallery_preview_photo")
 
+    def _is_hidden_name(self, name):
+        return name.startswith(".")
+
+    def _dir_contains_images(self, path):
+        path = os.path.abspath(path)
+        cached = self._gallery_dir_scan_cache.get(path)
+        if cached is not None:
+            return cached
+        if not os.path.isdir(path):
+            self._gallery_dir_scan_cache[path] = False
+            return False
+        result = False
+        try:
+            entries = os.listdir(path)
+        except OSError:
+            entries = []
+        for entry in entries:
+            if self._is_hidden_name(entry):
+                continue
+            full = os.path.join(path, entry)
+            if os.path.islink(full):
+                continue
+            if os.path.isfile(full) and entry.lower().endswith((".png", ".jpg", ".jpeg")):
+                result = True
+                break
+            if os.path.isdir(full) and self._dir_contains_images(full):
+                result = True
+                break
+        self._gallery_dir_scan_cache[path] = result
+        return result
+
+    def _has_visible_subdirs(self, path):
+        try:
+            entries = os.listdir(path)
+        except OSError:
+            return False
+        for entry in entries:
+            if self._is_hidden_name(entry):
+                continue
+            full = os.path.join(path, entry)
+            if not os.path.isdir(full) or os.path.islink(full):
+                continue
+            if self._dir_contains_images(full):
+                return True
+        return False
+
+    def _gallery_size_description(self, idx):
+        idx = max(0, min(len(GALLERY_TILE_SIZE_PRESETS) - 1, idx))
+        name, size = GALLERY_TILE_SIZE_PRESETS[idx]
+        return f"{name} ({size} px)"
+
+    def _resolve_gallery_tile_mode(self, saved_mode, saved_size):
+        if 0 <= saved_mode < len(GALLERY_TILE_SIZE_PRESETS):
+            return saved_mode
+        if saved_size <= 0:
+            return 2
+        best_idx = 0
+        best_diff = float("inf")
+        for idx, (_label, size) in enumerate(GALLERY_TILE_SIZE_PRESETS):
+            diff = abs(size - saved_size)
+            if diff < best_diff:
+                best_diff = diff
+                best_idx = idx
+        return best_idx
+
     def _on_gallery_tile_size_change(self, value):
-        if not self.gallery_tile_size_var:
+        if not (self.gallery_tile_size_var and self.gallery_tile_mode_var):
             return
         try:
-            size = int(float(value))
+            idx = int(round(float(value)))
         except (TypeError, ValueError):
             return
-        size = max(32, min(512, size))
-        if self.gallery_tile_size_var.get() == size:
+        idx = max(0, min(len(GALLERY_TILE_SIZE_PRESETS) - 1, idx))
+        if self.gallery_tile_mode_var.get() == idx:
             if self.gallery_tile_label:
-                self.gallery_tile_label.config(text=f"{size} px")
+                self.gallery_tile_label.config(text=self._gallery_size_description(idx))
         else:
+            self.gallery_tile_mode_var.set(idx)
+        size = GALLERY_TILE_SIZE_PRESETS[idx][1]
+        if self.gallery_tile_size_var.get() != size:
             self.gallery_tile_size_var.set(size)
+        self._set_setting("gallery_tile_size_mode", idx)
         self._set_setting("gallery_tile_size", size)
         if self.gallery_tile_label:
-            self.gallery_tile_label.config(text=f"{size} px")
+            self.gallery_tile_label.config(text=self._gallery_size_description(idx))
         self._request_gallery_tile_render(force=True)
 
     def _on_gallery_tile_canvas_configure(self, _event=None):
@@ -1271,18 +1646,22 @@ class RasterAppBase:
         cached = self.gallery_tile_images.get(key)
         if cached:
             return cached
+        if not os.path.isfile(abs_path):
+            self.gallery_tile_images.pop(key, None)
+            return self._get_placeholder_thumbnail(size)
         cache_file = self._thumbnail_cache_path(abs_path, size)
         if os.path.isfile(cache_file):
             try:
                 with Image.open(cache_file) as img:
-                    thumb = img.copy()
-                photo = ImageTk.PhotoImage(thumb)
-                self.gallery_tile_images[key] = photo
-                return photo
+                    photo = ImageTk.PhotoImage(img.copy())
+                    self.gallery_tile_images[key] = photo
+                    return photo
             except Exception:
                 pass
         self._queue_thumbnail_generation(abs_path, size)
-        return self._get_placeholder_thumbnail(size)
+        photo = self._get_placeholder_thumbnail(size)
+        self.gallery_tile_images[key] = photo
+        return photo
 
     def _request_gallery_tile_render(self, force=False):
         if not self.gallery_tile_canvas:
@@ -1293,26 +1672,63 @@ class RasterAppBase:
         delay = 0 if force else 100
         self.after(delay, self._render_gallery_tiles)
 
+    def _update_gallery_loading_status(self):
+        if not self.gallery_loading_var:
+            return
+        pending = len(self.thumbnail_pending)
+        if pending <= 0:
+            self.gallery_loading_var.set("")
+        else:
+            self.gallery_loading_var.set(f"Lädt {pending}…")
+
     def _render_gallery_tiles(self):
         if not self.gallery_tile_canvas:
             self.gallery_tile_render_pending = False
             return
         self.gallery_tile_render_pending = False
-        if not self.gallery_tile_canvas:
-            return
         canvas = self.gallery_tile_canvas
         width = canvas.winfo_width()
         if width <= 1:
             self.after(100, self._render_gallery_tiles)
             return
-        canvas.delete("tile_item")
-        self.gallery_tile_tag_map = {}
-        self.gallery_tile_rects = {}
+        token = self._gallery_render_token + 1
+        self._gallery_render_token = token
         padding = 10
         label_space = 24
         size = self.gallery_tile_size_var.get() if self.gallery_tile_size_var else 128
         columns = max(1, (width - padding) // (size + padding))
-        for idx, filename in enumerate(self.gallery_files):
+        self._gallery_columns = columns
+        canvas.delete("tile_item")
+        self.gallery_tile_tag_map = {}
+        self.gallery_tile_rects = {}
+        self._gallery_tile_render_info = {
+            "files": list(self.gallery_files),
+            "columns": columns,
+            "padding": padding,
+            "label_space": label_space,
+            "size": size,
+            "width": width,
+            "canvas": canvas,
+        }
+        self._render_gallery_tiles_batch(0, token)
+
+    def _render_gallery_tiles_batch(self, start_idx, token, batch_size=60):
+        if token != self._gallery_render_token:
+            return
+        info = self._gallery_tile_render_info
+        if not info:
+            return
+        files = info["files"]
+        total = len(files)
+        if start_idx >= total:
+            return
+        columns = info["columns"]
+        padding = info["padding"]
+        label_space = info["label_space"]
+        size = info["size"]
+        canvas = info["canvas"]
+        for offset, filename in enumerate(files[start_idx:start_idx + batch_size]):
+            idx = start_idx + offset
             col = idx % columns
             row = idx // columns
             x = padding + col * (size + padding) + size / 2
@@ -1339,10 +1755,111 @@ class RasterAppBase:
             self.gallery_tile_tag_map[tag] = filename
             self.gallery_tile_rects[filename] = rect
 
-        rows = math.ceil(len(self.gallery_files) / columns) if columns else 0
-        height = padding + rows * (size + label_space + padding)
-        canvas.configure(scrollregion=(0, 0, width, height))
-        self._select_in_tiles(self.gallery_selected_file)
+        next_idx = start_idx + batch_size
+        if next_idx < total:
+            self.after(10, lambda idx=next_idx, tok=token: self._render_gallery_tiles_batch(idx, tok, batch_size))
+        else:
+            rows = math.ceil(total / columns) if columns else 0
+            height = padding + rows * (size + label_space + padding)
+            canvas.configure(scrollregion=(0, 0, info["width"], height))
+            self._select_in_tiles(self.gallery_selected_files, self.gallery_selected_file)
+
+    def _on_gallery_mousewheel(self, event):
+        if not self.gallery_tile_canvas:
+            return "break"
+        if hasattr(event, "num") and event.num in (4, 5):
+            delta = -3 if event.num == 4 else 3
+        else:
+            delta = -int(event.delta / 120) if event.delta else 0
+        if delta != 0:
+            self.gallery_tile_canvas.yview_scroll(delta, "units")
+        return "break"
+
+    def _selection_mode_from_event(self, event):
+        state = getattr(event, "state", 0)
+        shift = bool(state & 0x0001)
+        ctrl = bool(state & (0x0004 | 0x0008))
+        if shift and self.gallery_selection_anchor:
+            return "range"
+        if ctrl:
+            return "toggle"
+        return "replace"
+
+    def _handle_gallery_navigation(self, event=None, rows=0, cols=0, absolute=None):
+        mode = self._selection_mode_from_event(event) if event else "replace"
+        self._move_gallery_selection(rows, cols, absolute, mode)
+        return "break"
+
+    def _handle_gallery_open(self, _event=None):
+        if self.gallery_selected_file:
+            self._open_gallery_image(self.gallery_selected_file)
+        return "break"
+
+    def _delete_selected_tiles(self, _event=None):
+        selection = list(self.gallery_selected_files) or ([self.gallery_selected_file] if self.gallery_selected_file else [])
+        if not selection:
+            messagebox.showinfo("Löschen", "Keine Dateien ausgewählt.")
+            return "break"
+        if not self.gallery_current_dir or not os.path.isdir(self.gallery_current_dir):
+            return "break"
+        plural = len(selection) > 1
+        names = "\n".join(selection[:10])
+        if len(selection) > 10:
+            names += "\n…"
+        if not messagebox.askyesno(
+            "Löschen bestätigen",
+            f"Sollen {len(selection)} Datei(en) gelöscht werden?\n{names}"
+        ):
+            return "break"
+        deleted = []
+        errors = []
+        for name in selection:
+            path = os.path.join(self.gallery_current_dir, name)
+            try:
+                os.remove(path)
+                self._purge_thumbnail_cache(path)
+                deleted.append(name)
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
+        if deleted:
+            self.gallery_files = [name for name in self.gallery_files if name not in deleted]
+            self.gallery_selected_files = []
+            self.gallery_selected_file = None
+            self.gallery_selection_anchor = None
+            self._request_gallery_tile_render(force=True)
+        if errors:
+            messagebox.showerror("Fehler beim Löschen", "\n".join(errors))
+        elif deleted:
+            messagebox.showinfo("Gelöscht", f"{len(deleted)} Datei(en) gelöscht.")
+            self._refresh_gallery(self.gallery_current_dir)
+        return "break"
+
+    def _move_gallery_selection(self, delta_rows=0, delta_cols=0, absolute=None, mode="replace"):
+        if not self.gallery_files:
+            return
+        columns = max(1, self._gallery_columns or 1)
+        total = len(self.gallery_files)
+        if absolute == "start":
+            target_idx = 0
+        elif absolute == "end":
+            target_idx = total - 1
+        else:
+            try:
+                current_idx = self.gallery_files.index(self.gallery_selected_file)
+            except ValueError:
+                current_idx = 0
+            max_rows = max(0, (total - 1) // columns)
+            row = current_idx // columns
+            col = current_idx % columns
+            row = max(0, min(row + delta_rows, max_rows))
+            col = max(0, min(col + delta_cols, columns - 1))
+            target_idx = row * columns + col
+            if target_idx >= total:
+                target_idx = total - 1
+        filename = self.gallery_files[target_idx]
+        self._set_gallery_selection(filename, mode=mode if absolute is None else ("range" if mode == "range" else "replace"))
+        if self.gallery_tile_canvas:
+            self.gallery_tile_canvas.focus_set()
 
     def _filename_from_tile_event(self, event):
         if not self.gallery_tile_canvas:
@@ -1359,16 +1876,23 @@ class RasterAppBase:
     def _on_gallery_tile_click(self, event):
         filename = self._filename_from_tile_event(event)
         if filename:
-            self._set_gallery_selection(filename, source="tiles")
+            mode = self._selection_mode_from_event(event)
+            self._set_gallery_selection(filename, source="tiles", mode=mode)
+            if self.gallery_tile_canvas:
+                self.gallery_tile_canvas.focus_set()
 
     def _on_gallery_tile_double(self, event):
         filename = self._filename_from_tile_event(event)
         if filename:
-            self._set_gallery_selection(filename, source="tiles")
+            self._set_gallery_selection(filename, source="tiles", mode="replace")
             self._open_gallery_image(filename)
+            if self.gallery_tile_canvas:
+                self.gallery_tile_canvas.focus_set()
 
     def _clear_gallery_preview(self):
         self.gallery_selected_file = None
+        self.gallery_selected_files = []
+        self.gallery_selection_anchor = None
         self._gallery_preview_base = None
         self._select_in_tiles(None)
         if self.gallery_preview_label:
@@ -1376,13 +1900,11 @@ class RasterAppBase:
 
     def _update_gallery_preview_display(self, filename):
         path = os.path.join(self.gallery_current_dir, filename)
-        try:
-            with Image.open(path) as img:
-                display = img.convert("RGB")
-        except Exception as e:
-            messagebox.showerror("Galerie", f"Bild konnte nicht geladen werden:\n{e}")
+        display = self._load_image_for_preview(path, GALLERY_PREVIEW_MAX_DIMENSION)
+        if display is None:
+            messagebox.showerror("Galerie", "Bild konnte nicht geladen werden.")
             return None
-        self._gallery_preview_base = display.copy()
+        self._gallery_preview_base = display
         self._render_gallery_preview_label()
         if self.gallery_preview_label:
             self.gallery_preview_label.config(text=filename)
@@ -1397,24 +1919,85 @@ class RasterAppBase:
             path = os.path.join(self.gallery_current_dir, filename)
             self._set_last_preview_path(path)
 
-    def _set_gallery_selection(self, filename, source=None, update_preview=True):
-        if not filename:
+    def _set_gallery_selection(self, filename, source=None, update_preview=True, mode="replace"):
+        if not filename or filename not in self.gallery_files:
             return
-        self.gallery_selected_file = filename
-        self._select_in_tiles(filename)
-        if update_preview:
-            self._update_gallery_preview_display(filename)
+        files = self.gallery_files
+        selection = list(self.gallery_selected_files) if self.gallery_selected_files else []
+        anchor = self.gallery_selection_anchor
 
-    def _select_in_tiles(self, filename):
+        if mode == "toggle":
+            if filename in selection and len(selection) > 1:
+                selection = [name for name in selection if name != filename]
+            elif filename in selection:
+                selection = [filename]
+            else:
+                selection.append(filename)
+                anchor = anchor or filename
+        elif mode == "range" and anchor in files:
+            start = files.index(anchor)
+            end = files.index(filename)
+            if start <= end:
+                selection = files[start:end + 1]
+            else:
+                selection = files[end:start + 1]
+        else:
+            selection = [filename]
+            anchor = filename
+
+        ordered = []
+        seen = set()
+        for name in files:
+            if name in selection and name not in seen:
+                ordered.append(name)
+                seen.add(name)
+        if not ordered:
+            ordered = [filename]
+
+        self.gallery_selected_files = ordered
+        self.gallery_selected_file = ordered[-1]
+        self.gallery_selection_anchor = anchor or self.gallery_selected_file
+        self._select_in_tiles(self.gallery_selected_files, self.gallery_selected_file)
+        self._scroll_tile_into_view(self.gallery_selected_file)
+        if update_preview:
+            self._open_gallery_image(self.gallery_selected_file)
+
+    def _select_in_tiles(self, filenames, primary=None):
         if not self.gallery_tile_rects:
             return
+        selected = set(filenames or [])
+        primary = primary or (filenames[-1] if filenames else None)
         for name, rect in self.gallery_tile_rects.items():
             if not self.gallery_tile_canvas:
                 break
-            if name == filename:
-                self.gallery_tile_canvas.itemconfigure(rect, outline="#2b6cb0", width=2)
+            if name == primary:
+                self.gallery_tile_canvas.itemconfigure(rect, outline="#2b6cb0", width=3)
+            elif name in selected:
+                self.gallery_tile_canvas.itemconfigure(rect, outline="#4a90e2", width=2)
             else:
                 self.gallery_tile_canvas.itemconfigure(rect, outline="#666666", width=1)
+
+    def _scroll_tile_into_view(self, filename):
+        if not self.gallery_tile_canvas or not filename:
+            return
+        rect = self.gallery_tile_rects.get(filename)
+        if not rect:
+            return
+        bbox = self.gallery_tile_canvas.bbox(rect)
+        if not bbox:
+            return
+        canvas = self.gallery_tile_canvas
+        view_top = canvas.canvasy(0)
+        view_bottom = view_top + canvas.winfo_height()
+        tile_top, tile_bottom = bbox[1], bbox[3]
+        if tile_top < view_top:
+            total = canvas.bbox("all")
+            total_height = total[3] if total else 1
+            canvas.yview_moveto(max(0, (tile_top - 10) / max(1, total_height)))
+        elif tile_bottom > view_bottom:
+            total = canvas.bbox("all")
+            total_height = total[3] if total else 1
+            canvas.yview_moveto(max(0, min(1, (tile_bottom - canvas.winfo_height() + 10) / max(1, total_height))))
 
     def _start_progress(self, total, text=""):
         if not self.progress_bar:
@@ -1530,15 +2113,56 @@ class RasterAppBase:
         total = len(batches_F) * len(batches_E)
         return tiles_F, tiles_E, batches_F, batches_E, total, converted_rows
 
+    def _prepare_preview_image(self, img, limit=PREVIEW_MAX_DIMENSION):
+        if img is None:
+            return None
+        try:
+            img = ImageOps.exif_transpose(img)
+        except Exception:
+            pass
+        limit = max(1, int(limit))
+        width, height = img.size
+        if max(width, height) <= limit:
+            return img.copy()
+        return ImageOps.contain(img, (limit, limit), Image.LANCZOS)
+
+    def _load_image_for_preview(self, path, limit=PREVIEW_MAX_DIMENSION):
+        try:
+            limit = max(1, int(limit))
+        except Exception:
+            limit = PREVIEW_MAX_DIMENSION
+        try:
+            with Image.open(path) as img:
+                img.draft("RGB", (limit, limit))
+                img = ImageOps.exif_transpose(img)
+                img.thumbnail((limit, limit), Image.LANCZOS)
+                return img.convert("RGB")
+        except Exception:
+            return None
+
+    def _update_preview_from_path(self, path, limit=PREVIEW_MAX_DIMENSION):
+        if not path or not os.path.isfile(path):
+            return False
+        img = self._load_image_for_preview(path, limit)
+        if img is None:
+            return False
+        self._update_preview(img)
+        self._set_last_preview_path(path)
+        return True
+
     def _update_preview(self, img):
         if img is None:
             return
-        self._preview_base_image = img.copy()
+        prepared = self._prepare_preview_image(img, PREVIEW_MAX_DIMENSION)
+        if prepared is None:
+            return
+        self._preview_base_image = prepared
         self._render_preview_label()
 
     def _set_last_preview_path(self, path):
         if path and os.path.isfile(path):
             self._set_setting("last_preview_image", path)
+            self.current_preview_path = path
 
     def _set_last_gallery_image_path(self, path):
         if path and os.path.isfile(path):
@@ -1547,6 +2171,14 @@ class RasterAppBase:
     def set_status(self, text):
         if self.status_var:
             self.status_var.set(text)
+
+    def _on_preview_double_click(self, _event=None):
+        path = self.current_preview_path or self._get_setting("last_preview_image")
+        if not path or not os.path.isfile(path):
+            messagebox.showwarning("Vorschau", "Kein Bild zum Öffnen verfügbar.")
+            return
+        if not _open_file_in_viewer(path):
+            messagebox.showwarning("Vorschau", "Bild konnte nicht geöffnet werden.")
 
     def log_message(self, message):
         print(message)
@@ -1633,15 +2265,11 @@ class RasterAppBase:
 
     def _restore_last_preview_images(self):
         main_path = self._get_setting("last_preview_image")
-        if main_path and os.path.isfile(main_path):
-            try:
-                with Image.open(main_path) as img:
-                    self._update_preview(img.convert("RGB"))
-            except Exception:
-                pass
+        if main_path:
+            self._update_preview_from_path(main_path)
         gallery_path = self._get_setting("last_gallery_image")
         if gallery_path and os.path.isfile(gallery_path):
-            self._handle_tree_file_selection(gallery_path, open_image=True)
+            self._focus_gallery_file(gallery_path, open_image=True)
 
     def _build_gallery_controls(self, parent):
         gallery_group = ttk.LabelFrame(parent, text="Galerie (output)")
@@ -1665,49 +2293,76 @@ class RasterAppBase:
         self.gallery_tree.bind("<<TreeviewSelect>>", self._on_gallery_dir_select)
         self.gallery_tree.bind("<<TreeviewOpen>>", self._on_gallery_tree_open)
 
-        self.gallery_lower_paned = ttk.Panedwindow(right_container, orient="vertical")
-        self.gallery_lower_paned.pack(fill="both", expand=True)
-        file_frame = ttk.Frame(self.gallery_lower_paned)
-        preview_frame = ttk.LabelFrame(self.gallery_lower_paned, text="Aktuelle Vorschau")
-        self.gallery_lower_paned.add(file_frame, weight=3)
-        self.gallery_lower_paned.add(preview_frame, weight=1)
-        self._register_panedwindow(self.gallery_lower_paned, "gallery_right", "vertical", 0.65)
+        self.gallery_lower_paned = None
+        file_frame = ttk.Frame(right_container)
+        file_frame.pack(fill="both", expand=True)
 
         controls = ttk.Frame(file_frame)
         controls.pack(fill="x", pady=(0, 4))
         ttk.Button(controls, text="Galerie aktualisieren", command=self._refresh_gallery).pack(side="left")
         ttk.Label(controls, text="Kachelgröße:").pack(side="left", padx=(8, 2))
-        self.gallery_tile_size_var = tk.IntVar(value=int(self._get_setting("gallery_tile_size", 128)))
-        self.gallery_tile_scale = ttk.Scale(
+        saved_mode = int(self._get_setting("gallery_tile_size_mode", -1))
+        saved_size = int(self._get_setting("gallery_tile_size", 96))
+        initial_mode = self._resolve_gallery_tile_mode(saved_mode, saved_size)
+        initial_size = GALLERY_TILE_SIZE_PRESETS[initial_mode][1]
+        self.gallery_tile_size_var = tk.IntVar(value=initial_size)
+        self.gallery_tile_mode_var = tk.IntVar(value=initial_mode)
+        self.gallery_tile_scale = tk.Scale(
             controls,
-            from_=48,
-            to=256,
+            from_=0,
+            to=len(GALLERY_TILE_SIZE_PRESETS) - 1,
             orient="horizontal",
+            resolution=1,
+            showvalue=False,
             command=self._on_gallery_tile_size_change,
         )
         self.gallery_tile_scale.pack(side="left", fill="x", expand=True, padx=4)
-        self.gallery_tile_label = ttk.Label(controls, text=f"{self.gallery_tile_size_var.get()} px")
+        self.gallery_tile_scale.set(initial_mode)
+        self.gallery_tile_label = ttk.Label(controls, text=self._gallery_size_description(initial_mode))
         self.gallery_tile_label.pack(side="left", padx=(4, 0))
-        self.gallery_tile_scale.set(self.gallery_tile_size_var.get())
+        ttk.Button(controls, text="Auswahl löschen", command=self._delete_selected_tiles).pack(side="left", padx=(6, 0))
+        self.gallery_loading_var = tk.StringVar(value="")
+        ttk.Label(controls, textvariable=self.gallery_loading_var, width=14, anchor="e").pack(side="right", padx=(6, 0))
+        self._update_gallery_loading_status()
 
-        canvas_frame = ttk.Frame(file_frame)
-        canvas_frame.pack(fill="both", expand=True)
+        grid_frame = ttk.LabelFrame(file_frame, text="Kachelübersicht")
+        grid_frame.pack(fill="both", expand=True)
+        canvas_frame = ttk.Frame(grid_frame)
+        canvas_frame.pack(fill="both", expand=True, padx=2, pady=(0, 4))
         self.gallery_tile_canvas = tk.Canvas(canvas_frame, highlightthickness=0)
         self.gallery_tile_canvas.pack(side="left", fill="both", expand=True)
         self.gallery_tile_scroll = ttk.Scrollbar(canvas_frame, orient="vertical", command=self.gallery_tile_canvas.yview)
         self.gallery_tile_scroll.pack(side="right", fill="y")
-        self.gallery_tile_canvas.configure(yscrollcommand=self.gallery_tile_scroll.set)
+        self.gallery_tile_canvas.configure(yscrollcommand=self.gallery_tile_scroll.set, takefocus=1)
         self.gallery_tile_canvas.bind("<Configure>", self._on_gallery_tile_canvas_configure)
+        self.gallery_tile_canvas.bind("<Button-1>", lambda _e: self.gallery_tile_canvas.focus_set())
         self.gallery_tile_canvas.tag_bind("tile_item", "<Button-1>", self._on_gallery_tile_click)
         self.gallery_tile_canvas.tag_bind("tile_item", "<Double-Button-1>", self._on_gallery_tile_double)
+        self.gallery_tile_canvas.bind("<MouseWheel>", self._on_gallery_mousewheel)
+        self.gallery_tile_canvas.bind("<Button-4>", self._on_gallery_mousewheel)
+        self.gallery_tile_canvas.bind("<Button-5>", self._on_gallery_mousewheel)
+        nav_bindings = {
+            "<Left>": (0, -1),
+            "<Right>": (0, 1),
+            "<Up>": (-1, 0),
+            "<Down>": (1, 0),
+        }
+        for seq, (dr, dc) in nav_bindings.items():
+            self.gallery_tile_canvas.bind(seq, lambda e, r=dr, c=dc: self._handle_gallery_navigation(e, r, c))
+        self.gallery_tile_canvas.bind("<Home>", lambda e: self._handle_gallery_navigation(e, absolute="start"))
+        self.gallery_tile_canvas.bind("<End>", lambda e: self._handle_gallery_navigation(e, absolute="end"))
+        self.gallery_tile_canvas.bind("<Prior>", lambda e: self._handle_gallery_navigation(e, rows=-5))
+        self.gallery_tile_canvas.bind("<Next>", lambda e: self._handle_gallery_navigation(e, rows=5))
+        self.gallery_tile_canvas.bind("<Return>", self._handle_gallery_open)
+        self.gallery_tile_canvas.bind("<Delete>", self._delete_selected_tiles)
+        self.gallery_tile_canvas.bind("<BackSpace>", self._delete_selected_tiles)
 
-        self.gallery_preview_label = ttk.Label(preview_frame, text="Keine Auswahl")
-        self.gallery_preview_label.pack(fill="both", expand=True, padx=6, pady=(6, 6))
-        self.gallery_preview_label.bind("<Configure>", self._render_gallery_preview_label)
+        self.gallery_preview_label = None
 
     def _refresh_gallery(self, highlight_path=None):
         if not self.gallery_tree:
             return
+        self._gallery_dir_scan_cache = {}
         ensure_folder(self.gallery_root)
         self.gallery_tree.delete(*self.gallery_tree.get_children())
         self.gallery_tile_images.clear()
@@ -1718,22 +2373,27 @@ class RasterAppBase:
         self.gallery_tree.item(self.gallery_tree_root_id, open=True)
         self._populate_tree_children(self.gallery_tree_root_id)
         default_dir = self._get_setting("gallery_last_dir", os.path.join(self.gallery_root, "output"))
-        target_dir = os.path.dirname(highlight_path) if highlight_path else default_dir
+        target_dir = default_dir
+        highlight_file = None
+        if highlight_path:
+            if os.path.isdir(highlight_path):
+                target_dir = highlight_path
+            elif os.path.isfile(highlight_path):
+                target_dir = os.path.dirname(highlight_path)
+                highlight_file = os.path.basename(highlight_path)
         if not target_dir or not os.path.isdir(target_dir):
             target_dir = self.gallery_root
         self._select_gallery_dir(target_dir)
-        if highlight_path and os.path.isfile(highlight_path):
-            self._handle_tree_file_selection(highlight_path, open_image=True)
+        if highlight_file and highlight_file in self.gallery_files:
+            self._set_gallery_selection(highlight_file)
+            self._open_gallery_image(highlight_file)
 
     def _add_tree_dir(self, parent_id, path):
         text = os.path.basename(path) or path
         node_id = self.gallery_tree.insert(parent_id, "end", text=text, values=(path, "dir"))
-        self.gallery_tree.insert(node_id, "end", text="…", values=(path, "placeholder"))
+        if self._has_visible_subdirs(path):
+            self.gallery_tree.insert(node_id, "end", text="…", values=(path, "placeholder"))
         return node_id
-
-    def _add_tree_file(self, parent_id, path):
-        text = os.path.basename(path)
-        return self.gallery_tree.insert(parent_id, "end", text=text, values=(path, "file"))
 
     def _populate_tree_children(self, node_id):
         values = self.gallery_tree.item(node_id, "values")
@@ -1752,11 +2412,14 @@ class RasterAppBase:
         except OSError:
             entries = []
         for entry in entries:
+            if self._is_hidden_name(entry):
+                continue
             full = os.path.join(path, entry)
-            if os.path.isdir(full):
-                self._add_tree_dir(node_id, full)
-            elif entry.lower().endswith((".png", ".jpg", ".jpeg")):
-                self._add_tree_file(node_id, full)
+            if not os.path.isdir(full) or os.path.islink(full):
+                continue
+            if not self._dir_contains_images(full):
+                continue
+            self._add_tree_dir(node_id, full)
 
     def _ensure_tree_path(self, target_path):
         if not self.gallery_tree_root_id:
@@ -1792,24 +2455,8 @@ class RasterAppBase:
             node = match
         return node
 
-    def _handle_tree_file_selection(self, filepath, open_image=True):
-        directory = os.path.dirname(filepath)
-        if directory and os.path.isdir(directory):
-            if os.path.abspath(directory) != os.path.abspath(self.gallery_current_dir):
-                self._populate_gallery_files(directory)
-        node = self._ensure_tree_path(filepath)
-        if node:
-            current_selection = set(self.gallery_tree.selection())
-            if node not in current_selection:
-                self.gallery_tree.selection_set(node)
-                self.gallery_tree.see(node)
-        filename = os.path.basename(filepath)
-        self._set_gallery_selection(filename)
-        if open_image:
-            self._open_gallery_image(filename)
-
     def _select_gallery_dir(self, path):
-        if not self.gallery_tree:
+        if not self.gallery_tree or not path:
             return
         item = self._ensure_tree_path(path)
         if not item:
@@ -1818,13 +2465,20 @@ class RasterAppBase:
         self.gallery_tree.see(item)
         self.gallery_tree.item(item, open=True)
         values = self.gallery_tree.item(item, "values")
-        if values:
-            node_type = values[1] if len(values) > 1 else "dir"
-            if node_type == "file":
-                self._handle_tree_file_selection(values[0], open_image=False)
-            else:
-                self.gallery_current_dir = values[0]
-                self._populate_gallery_files(values[0])
+        directory = values[0] if values else path
+        if directory and os.path.isdir(directory):
+            self.gallery_current_dir = directory
+            self._populate_gallery_files(directory)
+
+    def _focus_gallery_file(self, filepath, open_image=True):
+        if not filepath or not os.path.isfile(filepath):
+            return
+        directory = os.path.dirname(filepath)
+        if directory:
+            self._select_gallery_dir(directory)
+        filename = os.path.basename(filepath)
+        if filename in self.gallery_files:
+            self._set_gallery_selection(filename, update_preview=open_image)
 
     def _populate_gallery_files(self, directory):
         self.gallery_current_dir = directory
@@ -1832,6 +2486,8 @@ class RasterAppBase:
         files = []
         try:
             for name in sorted(os.listdir(directory)):
+                if self._is_hidden_name(name):
+                    continue
                 full = os.path.join(directory, name)
                 if os.path.isfile(full) and name.lower().endswith((".png", ".jpg", ".jpeg")):
                     files.append(name)
@@ -1840,6 +2496,8 @@ class RasterAppBase:
         self.gallery_files = files
 
         restore_file = self.gallery_selected_file if self.gallery_selected_file in files else None
+        if self.gallery_tile_canvas:
+            self.gallery_tile_canvas.yview_moveto(0)
         self._request_gallery_tile_render(force=True)
 
         if restore_file:
@@ -1863,11 +2521,10 @@ class RasterAppBase:
         values = self.gallery_tree.item(item, "values")
         if not values:
             return
-        node_type = values[1] if len(values) > 1 else "dir"
-        if node_type == "file":
-            self._handle_tree_file_selection(values[0], open_image=True)
-        else:
-            self._populate_gallery_files(values[0])
+        directory = values[0]
+        if directory and os.path.isdir(directory):
+            self.gallery_current_dir = directory
+            self._populate_gallery_files(directory)
 
     def _select_mosaic_image(self):
         path = filedialog.askopenfilename(
@@ -1966,7 +2623,10 @@ class RasterAppBase:
 
         self._finish_progress()
 
-        self._update_preview(result["image"])
+        preview_loaded = self._update_preview_from_path(result["path"])
+        if not preview_loaded:
+            self._update_preview(result["image"])
+            self._set_last_preview_path(result["path"])
         summary = (
             f"Mosaik gespeichert als: {result['path']} "
             f"({result['cols']} x {result['rows']} Tiles)"
@@ -1975,7 +2635,6 @@ class RasterAppBase:
         self._refresh_gallery(result["path"])
         messagebox.showinfo("Mosaik erstellt", summary)
         self.set_status("Mosaik fertig.")
-        self._set_last_preview_path(result["path"])
 
 
 class MultiFilePicker(tk.Toplevel):
@@ -2258,11 +2917,17 @@ if DND_AVAILABLE:
             gallery_container = ttk.Frame(self.right_paned)
             self.right_paned.add(preview_group, weight=2)
             self.right_paned.add(gallery_container, weight=3)
+            try:
+                self.right_paned.paneconfigure(preview_group, minsize=180)
+                self.right_paned.paneconfigure(gallery_container, minsize=260)
+            except tk.TclError:
+                pass
             self._register_panedwindow(self.right_paned, "right", "vertical", 0.5)
 
             self.preview_label = ttk.Label(preview_group)
             self.preview_label.pack(fill="both", expand=True, padx=6, pady=6)
             self.preview_label.bind("<Configure>", self._render_preview_label)
+            self.preview_label.bind("<Double-Button-1>", self._on_preview_double_click)
 
             self._build_gallery_controls(gallery_container)
 
@@ -2321,13 +2986,18 @@ if DND_AVAILABLE:
                 self.set_status("Fehler beim Generieren.")
                 return
 
-        self._update_preview(last_img)
-        for path in paths:
-            self.log_message(f"Raster gespeichert als: {path}")
-        if paths:
-            self._refresh_gallery(paths[-1])
-            self._set_last_preview_path(paths[-1])
-        self.set_status("Fertig.")
+            preview_loaded = False
+            if paths:
+                preview_loaded = self._update_preview_from_path(paths[-1])
+            if not preview_loaded and last_img is not None:
+                self._update_preview(last_img)
+                if paths:
+                    self._set_last_preview_path(paths[-1])
+            for path in paths:
+                self.log_message(f"Raster gespeichert als: {path}")
+            if paths:
+                self._refresh_gallery(paths[-1])
+            self.set_status("Fertig.")
 
         def _on_generate_all(self):
             pattern_rows = self._get_pattern_rows()
@@ -2378,10 +3048,15 @@ if DND_AVAILABLE:
                 self.set_status("Keine Raster erzeugt.")
                 return
 
-            self._update_preview(last_img)
+            preview_loaded = False
+            if paths:
+                preview_loaded = self._update_preview_from_path(paths[-1])
+            if not preview_loaded and last_img is not None:
+                self._update_preview(last_img)
+                if paths:
+                    self._set_last_preview_path(paths[-1])
             if paths:
                 self._refresh_gallery(paths[-1])
-                self._set_last_preview_path(paths[-1])
             self.set_status("Batch abgeschlossen.")
             messagebox.showinfo("Batch abgeschlossen", f"{len(paths)} Raster gespeichert.")
 
@@ -2511,17 +3186,24 @@ else:
             gallery_container = ttk.Frame(self.right_paned)
             self.right_paned.add(preview_group, weight=2)
             self.right_paned.add(gallery_container, weight=3)
+            try:
+                self.right_paned.paneconfigure(preview_group, minsize=180)
+                self.right_paned.paneconfigure(gallery_container, minsize=260)
+            except tk.TclError:
+                pass
             self._register_panedwindow(self.right_paned, "right", "vertical", 0.5)
 
             self.preview_label = ttk.Label(preview_group)
             self.preview_label.pack(fill="both", expand=True, padx=6, pady=6)
             self.preview_label.bind("<Configure>", self._render_preview_label)
+            self.preview_label.bind("<Double-Button-1>", self._on_preview_double_click)
 
             self._build_gallery_controls(gallery_container)
 
             self.status_var = tk.StringVar(value="Bereit")
             ttk.Label(preview_area, textvariable=self.status_var, relief="sunken").pack(fill="x", pady=(8, 0))
             self._refresh_gallery()
+            self.after(400, self._restore_last_preview_images)
 
         def _select_files_dialog(self):
             paths = self._open_file_picker()
@@ -2560,12 +3242,17 @@ else:
                 self.set_status("Fehler beim Generieren.")
                 return
 
-            self._update_preview(last_img)
+            preview_loaded = False
+            if paths:
+                preview_loaded = self._update_preview_from_path(paths[-1])
+            if not preview_loaded and last_img is not None:
+                self._update_preview(last_img)
+                if paths:
+                    self._set_last_preview_path(paths[-1])
             for path in paths:
                 self.log_message(f"Raster gespeichert als: {path}")
             if paths:
                 self._refresh_gallery(paths[-1])
-                self._set_last_preview_path(paths[-1])
             self.set_status("Fertig.")
 
         def _on_generate_all(self):
@@ -2617,10 +3304,15 @@ else:
                 self.set_status("Keine Raster erzeugt.")
                 return
 
-            self._update_preview(last_img)
+            preview_loaded = False
+            if paths:
+                preview_loaded = self._update_preview_from_path(paths[-1])
+            if not preview_loaded and last_img is not None:
+                self._update_preview(last_img)
+                if paths:
+                    self._set_last_preview_path(paths[-1])
             if paths:
                 self._refresh_gallery(paths[-1])
-                self._set_last_preview_path(paths[-1])
             self.set_status("Batch abgeschlossen.")
             messagebox.showinfo("Batch abgeschlossen", f"{len(paths)} Raster gespeichert.")
 
